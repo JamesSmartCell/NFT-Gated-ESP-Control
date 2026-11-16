@@ -1,0 +1,13 @@
+# ESP32 WROVER-KIT — dual OTA for 4 MB flash (matches Arduino default.csv)
+#
+# Your boot ROM reported flash size 0x400000 (4 MB). A 16 MB-style table will
+# fail verification and loop forever — use wrover_ota_16mb.csv only if the
+# module really has 16 MB AND you set board_build.flash_size = 16MB in platformio.ini.
+#
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x140000,
+app1,     app,  ota_1,   0x150000,0x140000,
+spiffs,   data, spiffs,  0x290000,0x160000,
+coredump, data, coredump,0x3F0000,0x10000,
