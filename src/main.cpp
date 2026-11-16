@@ -9,9 +9,6 @@
 
 #include "esp_system.h"
 
-#define USING_INFURA 1
-#define INFURA_KEY 48a611a8ab0d4b6d91ffd2f0eeae389e
-
 #include <Web3.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -24,13 +21,6 @@
 #include <string>
 #include <vector>
 #include <SPI.h>
-
-const char* ssid = "TP-Link_D280";
-const char* password = "03562208";
-const char* ssid3 = "Necroponte";
-const char* password3 = "FreeBitcoins#77Delta";
-const char* ssid2 = "WeWork";
-const char* password2 = "P@ssw0rd";
 
 // Home SSID is listed twice: the first attempt often returns before DHCP.
 static const WiFiCredentials wifiNetworks[] = {
