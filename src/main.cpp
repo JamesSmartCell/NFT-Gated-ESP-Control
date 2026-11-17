@@ -99,12 +99,20 @@ string currentChallenge;
 unsigned long lastOTACheck = 0;
 unsigned long lastOTARequest = 0;
 
+// OTA failure tracking (prevent retry of failed versions within 24h)
+struct OTAFailure {
+  char version[64];
+  unsigned long timestamp;
+};
+OTAFailure lastOTAFailure = {"", 0};
+#define OTA_FAILURE_RETRY_INTERVAL_MS (24UL * 60 * 60 * 1000)  // 24 hours
+
 // ===== FORWARD DECLARATIONS =====
 void updateChallenge();
 void startGarageOpen(int openSeconds);
 void operateGarageDoor();
 bool checkForUpdate();
-void performOTA(const char* firmwareUrl, const char* expectedSha256, size_t expectedSize);
+void performOTA(const char* firmwareUrl, const char* expectedSha256, size_t expectedSize, const char* versionStr = nullptr);
 bool writeWifiStoreFromSecrets();
 
 // ===== UTILITY FUNCTIONS =====
@@ -159,6 +167,69 @@ bool QueryBalance(const char* contractAddr, std::string* userAddress)
 }
 
 // ===== OTA UPDATE FUNCTIONS =====
+
+/**
+ * Parse semver string and extract MAJOR.MINOR.PATCH
+ * Handles formats: "1.2.0", "v1.2.0", "1.2.0+hash", "project@1.2.0+hash"
+ * Returns true if parsed successfully
+ */
+bool parseSemver(const char* versionStr, int& major, int& minor, int& patch, char* projectId = nullptr)
+{
+  if (!versionStr || strlen(versionStr) == 0)
+    return false;
+  
+  const char* semverStart = versionStr;
+  
+  // Check for project prefix "project@"
+  const char* atSign = strchr(versionStr, '@');
+  if (atSign)
+  {
+    if (projectId)
+    {
+      size_t projectLen = atSign - versionStr;
+      if (projectLen >= 32) return false;  // Project ID too long
+      strncpy(projectId, versionStr, projectLen);
+      projectId[projectLen] = '\0';
+    }
+    semverStart = atSign + 1;
+  }
+  else if (projectId)
+  {
+    projectId[0] = '\0';  // No project prefix
+  }
+  
+  // Skip optional 'v' prefix
+  if (semverStart[0] == 'v' || semverStart[0] == 'V')
+    semverStart++;
+  
+  // Parse MAJOR.MINOR.PATCH
+  char* end;
+  major = strtol(semverStart, &end, 10);
+  if (*end != '.') return false;
+  
+  minor = strtol(end + 1, &end, 10);
+  if (*end != '.') return false;
+  
+  patch = strtol(end + 1, &end, 10);
+  
+  // End should be '\0', '+' (build metadata), or '-' (prerelease)
+  if (*end != '\0' && *end != '+' && *end != '-')
+    return false;
+  
+  return true;
+}
+
+/**
+ * Compare two semver versions
+ * Returns: -1 if v1 < v2, 0 if equal, 1 if v1 > v2
+ */
+int compareSemver(int major1, int minor1, int patch1, int major2, int minor2, int patch2)
+{
+  if (major1 != major2) return (major1 > major2) ? 1 : -1;
+  if (minor1 != minor2) return (minor1 > minor2) ? 1 : -1;
+  if (patch1 != patch2) return (patch1 > patch2) ? 1 : -1;
+  return 0;
+}
 
 /**
  * Check for firmware updates from SmartLayerProxy
@@ -219,11 +290,54 @@ bool checkForUpdate()
   
   Serial.printf("[OTA] Current: %s, Available: %s\n", FW_VERSION, newVersion);
   
-  // Simple version comparison: only upgrade if version strings differ
-  // In production, use semver comparison to only upgrade to newer versions
-  if (strcmp(FW_VERSION, newVersion) == 0)
+  // Parse current version (from FIRMWARE_SEMVER)
+  int currentMajor, currentMinor, currentPatch;
+  if (!parseSemver(FIRMWARE_SEMVER, currentMajor, currentMinor, currentPatch))
   {
-    Serial.println("[OTA] Already running latest version");
+    Serial.printf("[OTA] ERROR: Failed to parse current version: %s\n", FIRMWARE_SEMVER);
+    return false;
+  }
+  
+  // Parse available version from proxy
+  int newMajor, newMinor, newPatch;
+  char newProjectId[32];
+  if (!parseSemver(newVersion, newMajor, newMinor, newPatch, newProjectId))
+  {
+    Serial.printf("[OTA] ERROR: Failed to parse available version: %s\n", newVersion);
+    return false;
+  }
+  
+  // Validate project ID if present in metadata
+  if (strlen(newProjectId) > 0 && strcmp(newProjectId, PROJECT_ID) != 0)
+  {
+    Serial.printf("[OTA] ERROR: Project ID mismatch: expected '%s', got '%s'\n", PROJECT_ID, newProjectId);
+    return false;
+  }
+  
+  // Compare versions
+  int cmp = compareSemver(newMajor, newMinor, newPatch, currentMajor, currentMinor, currentPatch);
+  
+  Serial.printf("[OTA] Version comparison: current=%d.%d.%d, available=%d.%d.%d, cmp=%d\n",
+                currentMajor, currentMinor, currentPatch,
+                newMajor, newMinor, newPatch, cmp);
+  
+  if (cmp <= 0)
+  {
+    if (cmp == 0)
+      Serial.println("[OTA] Already running this version (or newer with different build metadata)");
+    else
+      Serial.printf("[OTA] Available version is OLDER than current (downgrade blocked)\n");
+    return false;
+  }
+  
+  // Check if this version failed recently (within 24h)
+  if (strlen(lastOTAFailure.version) > 0 &&
+      strcmp(lastOTAFailure.version, newVersion) == 0 &&
+      (millis() - lastOTAFailure.timestamp) < OTA_FAILURE_RETRY_INTERVAL_MS)
+  {
+    unsigned long remainingMs = OTA_FAILURE_RETRY_INTERVAL_MS - (millis() - lastOTAFailure.timestamp);
+    Serial.printf("[OTA] Version %s failed recently, retry blocked for %lu more seconds\n",
+                  newVersion, remainingMs / 1000);
     return false;
   }
   
@@ -233,7 +347,7 @@ bool checkForUpdate()
   Serial.printf("[OTA] Size: %zu bytes\n", size);
   
   // Perform OTA update
-  performOTA(firmwareUrl, sha256, size);
+  performOTA(firmwareUrl, sha256, size, newVersion);
   
   return true;
 }
@@ -241,7 +355,7 @@ bool checkForUpdate()
 /**
  * Download and install firmware with SHA-256 verification
  */
-void performOTA(const char* firmwareUrl, const char* expectedSha256, size_t expectedSize)
+void performOTA(const char* firmwareUrl, const char* expectedSha256, size_t expectedSize, const char* versionStr)
 {
   Serial.println("[OTA] Starting firmware download...");
   
@@ -275,6 +389,14 @@ void performOTA(const char* firmwareUrl, const char* expectedSha256, size_t expe
   {
     Serial.printf("[OTA] Size mismatch: expected %zu, got %zu\n", expectedSize, contentLength);
     http.end();
+    
+    // Track failure
+    if (versionStr && strlen(versionStr) < sizeof(lastOTAFailure.version))
+    {
+      strncpy(lastOTAFailure.version, versionStr, sizeof(lastOTAFailure.version) - 1);
+      lastOTAFailure.version[sizeof(lastOTAFailure.version) - 1] = '\0';
+      lastOTAFailure.timestamp = millis();
+    }
     return;
   }
   
@@ -360,6 +482,14 @@ void performOTA(const char* firmwareUrl, const char* expectedSha256, size_t expe
   {
     Serial.println("[OTA] SHA-256 verification FAILED!");
     Update.abort();
+    
+    // Track failure
+    if (versionStr && strlen(versionStr) < sizeof(lastOTAFailure.version))
+    {
+      strncpy(lastOTAFailure.version, versionStr, sizeof(lastOTAFailure.version) - 1);
+      lastOTAFailure.version[sizeof(lastOTAFailure.version) - 1] = '\0';
+      lastOTAFailure.timestamp = millis();
+    }
     return;
   }
   

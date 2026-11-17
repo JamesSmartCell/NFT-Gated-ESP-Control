@@ -197,7 +197,7 @@ The old authenticated `updateReady` API method (which required NFT ownership and
 
 ```bash
 # Update version in src/main.cpp
-vim src/main.cpp  # Change FIRMWARE_SEMVER
+vim src/main.cpp  # Change FIRMWARE_SEMVER (e.g., "1.3.0")
 
 # Commit changes
 git add src/main.cpp
@@ -218,15 +218,15 @@ cp .pio/build/esp32dev/firmware.bin releases/garagedoor-1.3.0+<hash>.bin
 
 ### 3. Upload to Firmware Service
 
-Use the SmartLayerProxy upload tool:
+Use the SmartLayerProxy upload tool with **plain semver**:
 
 ```bash
 cd /path/to/SmartLayerProxy
 
-# Upload firmware
+# Upload firmware with PLAIN SEMVER (matches FIRMWARE_SEMVER from main.cpp)
 node tools/firmware/upload.js \
   --project garagedoor \
-  --version "garagedoor@1.3.0+abc1234" \
+  --version "1.3.0" \
   --file /path/to/firmware.bin \
   --set-current
 
@@ -235,22 +235,61 @@ node tools/firmware/upload.js \
 # Registers metadata in firmware database
 ```
 
-**Tool fields used by device**:
-- `version`: Full version string (must match device format)
+**IMPORTANT**: The `--version` argument should be **plain semver** (e.g., `"1.3.0"`), matching the `FIRMWARE_SEMVER` value in `src/main.cpp`. The device will parse this correctly whether the proxy stores it as:
+- `"1.3.0"` (plain semver)
+- `"garagedoor@1.3.0"` (with project prefix)
+- `"garagedoor@1.3.0+abc1234"` (full format)
+
+**Tool fields stored by proxy**:
+- `version`: Semver string (e.g., `"1.3.0"` or with project/build metadata)
 - `url`: R2 public URL (e.g., `https://firmware.percolate.one/...`)
 - `sha256`: SHA-256 hex digest (64 chars, lowercase)
 - `size`: File size in bytes
+
+**Device version comparison**:
+- Extracts MAJOR.MINOR.PATCH from both formats
+- Compares using semver rules (only upgrades if newer)
+- Blocks downgrades
+- Validates project prefix if present (must match `PROJECT_ID`)
+- Ignores build metadata (git hash) during comparison
 
 ### 4. Notify Devices (Optional)
 
 The proxy can push an `updateReady` notification to trigger immediate checks:
 
-```bash
-# Via SmartLayerProxy admin API or TCP bridge
-# Devices will check within 60 seconds (rate limit)
+```javascript
+// Via SmartLayerProxy TCP bridge
+await tcpService.notifyDevices({
+  project: 'garagedoor',
+  api: 'updateReady'
+});
+// Devices check within 60 seconds (rate limit)
 ```
 
 Devices will also discover the update on their next periodic check (24h) or reboot.
+
+### Version Comparison Logic
+
+The device implements **strict semver comparison** with safety features:
+
+**Parsing:**
+- Handles formats: `"1.2.0"`, `"v1.2.0"`, `"1.2.0+hash"`, `"project@1.2.0+hash"`
+- Extracts MAJOR.MINOR.PATCH (ignores build metadata)
+- Validates project prefix if present (must match `PROJECT_ID`)
+
+**Comparison:**
+- Only installs if available version is **strictly newer** (MAJOR.MINOR.PATCH)
+- **Blocks downgrades** (e.g., won't install 1.1.0 when running 1.2.0)
+- Ignores build metadata differences (1.2.0+abc and 1.2.0+xyz are same version)
+
+**Failure tracking:**
+- If a version fails SHA-256 or size check, device won't retry it for 24 hours
+- Prevents infinite OTA loops on corrupt metadata
+- After 24h, device will retry in case issue was transient
+
+**Rate limiting:**
+- `updateReady` API limited to once per 60 seconds
+- Prevents rapid OTA attempts
 
 ## Partition Tables
 
