@@ -37,7 +37,7 @@
 // ===== FIRMWARE VERSION =====
 // Format: <PROJECT_ID>@<semver>+<shorthash>
 // Example: garagedoor@1.2.0+ab12cd3
-#define FIRMWARE_SEMVER "1.2.0"
+#define FIRMWARE_SEMVER "1.2.6"
 
 // GIT_SHORT_HASH is injected by git_version.py at build time
 #ifndef GIT_SHORT_HASH
