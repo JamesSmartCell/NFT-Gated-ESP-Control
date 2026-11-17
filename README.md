@@ -293,28 +293,14 @@ The device implements **strict semver comparison** with safety features:
 
 ## Partition Tables
 
-Three partition table configurations are provided:
+**Active**: `min_spiffs.csv` (ESP32, 4MB)
+- Dual OTA partitions (1.28MB each)
+- Minimal SPIFFS
+- **Required for OTA**: Two app slots for safe updates
 
-1. **`min_spiffs.csv`** (ESP32, 4MB) - **Default**:
-   - Dual OTA partitions (1.28MB each)
-   - Minimal SPIFFS
-   - **Required for OTA**: Two app slots for safe updates
-
-2. **`partitions.csv`** (ESP32-C6, 4MB):
-   - Single OTA partition (3MB app)
-   - Zigbee coordinator support
-   - SPIFFS, coredump
-
-3. **`wrover_ota.csv`** (ESP32 WROVER, 4MB):
-   - Dual OTA partitions (1.25MB each)
-   - SPIFFS, coredump
-
-4. **`wrover_ota_16mb.csv`** (ESP32 WROVER, 16MB):
-   - Dual OTA partitions (6.25MB each)
-   - Large SPIFFS (3.5MB)
-   - Requires `board_build.flash_size = 16MB` in platformio.ini
-
-**Active partition**: Selected via `board_build.partitions` in `platformio.ini`.
+**Alternative configurations** (not currently used by esp32dev):
+- **`wrover_ota.csv`** (4MB): Dual OTA + SPIFFS + coredump
+- **`wrover_ota_16mb.csv`** (16MB): Dual OTA (6.25MB each) + large SPIFFS
 
 **OTA Note**: The default `min_spiffs.csv` provides two OTA app slots as required by the ESP32 OTA mechanism. Binary size (1.35MB) fits comfortably in each 1.28MB partition.
 
@@ -490,10 +476,9 @@ NFT-Gated-ESP-Control/
 │   └── secrets.h             # Actual secrets (gitignored)
 ├── platformio.ini            # PlatformIO config (board, libs, flags)
 ├── git_version.py            # Build script: inject git hash
-├── partitions.csv            # Partition table (4MB, single OTA)
-├── wrover_ota.csv            # Partition table (4MB, dual OTA)
-├── wrover_ota_16mb.csv       # Partition table (16MB, dual OTA)
 ├── min_spiffs.csv            # Partition table (4MB, dual OTA, minimal SPIFFS) - DEFAULT
+├── wrover_ota.csv            # Partition table (4MB, dual OTA) - not used by esp32dev
+├── wrover_ota_16mb.csv       # Partition table (16MB, dual OTA) - not used by esp32dev
 └── README.md                 # This file
 ```
 

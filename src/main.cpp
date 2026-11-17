@@ -98,6 +98,8 @@ const int adminAddrsSz = 2;
 string currentChallenge;
 unsigned long lastOTACheck = 0;
 unsigned long lastOTARequest = 0;
+bool lastOTARequestInitialized = false;
+static volatile bool otaCheckRequested = false;
 
 // OTA failure tracking (prevent retry of failed versions within 24h)
 struct OTAFailure {
@@ -510,7 +512,7 @@ void performOTA(const char* firmwareUrl, const char* expectedSha256, size_t expe
     return;
   }
   
-  Serial.println("[OTA] ✓ Update successful! Rebooting...");
+  Serial.println("[OTA] Update successful! Rebooting...");
   delay(2000);
   ESP.restart();
 }
@@ -862,20 +864,20 @@ std::string handleTCPAPI(APIReturn* apiReturn)
   case api_updateReady:
   {
     // New unauthenticated OTA trigger (proxy pushes notification)
-    // Rate limited to once per 60 seconds
+    // Rate limited to once per 60 seconds (but first request always accepted)
     unsigned long now = millis();
-    if (now - lastOTARequest < OTA_RATE_LIMIT_MS)
+    if (lastOTARequestInitialized && (now - lastOTARequest < OTA_RATE_LIMIT_MS))
     {
       Serial.printf("[OTA] Rate limited (last request %lu ms ago)\n", now - lastOTARequest);
       return string("rate_limited");
     }
     
     lastOTARequest = now;
+    lastOTARequestInitialized = true;
     Serial.println("[OTA] Update notification received from proxy");
     
-    // Check for update in background (non-blocking response)
-    // The actual update will be checked and applied in loop()
-    lastOTACheck = 0;  // Force immediate check
+    // Request OTA check in loop() (non-blocking response)
+    otaCheckRequested = true;
     
     return string("checking");
   }
@@ -1030,6 +1032,15 @@ void loop()
   
   // Handle TCP API
   tcpConnection->checkClientAPI(&handleTCPAPI);
+  
+  // Check if OTA update was requested via updateReady API
+  if (otaCheckRequested)
+  {
+    otaCheckRequested = false;
+    Serial.println("[OTA] Notified update check");
+    checkForUpdate();
+    lastOTACheck = currentMillis;
+  }
   
   // Periodic OTA check (every 24 hours)
   if (currentMillis - lastOTACheck >= OTA_CHECK_INTERVAL_MS)
