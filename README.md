@@ -146,6 +146,52 @@ Firmware version follows the format: `<PROJECT_ID>@<semver>+<shorthash>`
 - `getVersion` API command
 - Reported to SmartLayerProxy in 0x09 firmware login
 
+## Device Revocation & Offline Reset
+
+Aligned with [Web3E-Setup-Firmware#3](https://github.com/JamesSmartCell/Web3E-Setup-Firmware/pull/3) and [SmartLayerProxy#16](https://github.com/JamesSmartCell/SmartLayerProxy/pull/16).
+
+### NVS contract (`lib/PortalBoot/` — same as setup firmware)
+
+| Item | Value |
+|------|--------|
+| Mechanism | Arduino `Preferences` / NVS (**not** EEPROM) |
+| Namespace | `web3e_boot` |
+| Key `stay_portal` | `uint8_t`: `1` = stay in portal; `0` = normal |
+| Key `boot_count` | `uint8_t`: consecutive quick-reboot counter |
+| EEPROM | **Never** touches KeyID (0–32) or WifiStore |
+
+### Revoke notice (`updateReady` extension)
+
+Same TCP transport as OTA notify (opcode `0x04`, method `updateReady`).
+
+| | Normal OTA | Revoke |
+|---|---|---|
+| args | _(none)_ | `purpose=revoke`, `version`, `sha256`, `size`, `message`, `signature` |
+| device response | `checking` / `rate_limited` | **`revoking`** (required before OTA) |
+
+- `message` = `revoke:<project>:<device>:<sha256>:<nonce>` (EIP-191 `personal_sign`)
+- `<device>` = lowercase `0x`-prefixed KeyID address; `<sha256>` binds the **setup** binary
+- URL is **not** on the wire. After verifying admin signature, device:
+  1. Replies `revoking`
+  2. Sets `stay_portal=1`
+  3. `GET /api/firmware/<project>/setup`, confirms metadata matches notice
+  4. Downloads `url`, verifies SHA-256, flashes setup, reboots
+
+### Triple power-cycle (offline Wi-Fi reset)
+
+| Constant | Value |
+|----------|-------|
+| `PORTAL_BOOT_TRIPLE_THRESHOLD` | `3` |
+| `PORTAL_BOOT_STABLE_MS` | `10000` (10 s) |
+
+On the 3rd quick reboot before the stable window, the app sets `stay_portal=1` and opens an **embedded** captive portal (same UX as setup: `ESP32-Setup-XXXX` @ `192.168.4.1`). KeyID and WifiStore are preserved. After **Done**, `stay_portal` is cleared and the device reboots into normal operation (no setup-firmware download — may be offline).
+
+**Wi-Fi / router outage alone never opens the AP** — existing reconnect/restart behaviour is kept.
+
+### Task watchdog
+
+`esp_task_wdt` (30 s) covers `loop()` so a hung main loop is recovered even when TcpBridge liveness is not running.
+
 ## OTA Firmware Updates
 
 ### New OTA Flow (Production)
@@ -157,7 +203,7 @@ Firmware binaries are stored in **Cloudflare R2** and coordinated by **SmartLaye
 The device checks for updates:
 1. **At boot** (after Wi-Fi connects)
 2. **Every 24 hours** (automatic periodic check)
-3. **On proxy push notification** (via `updateReady` API method, rate-limited to 60s)
+3. **On proxy push notification** (via `updateReady` API method, rate-limited to 60s; revoke notices use the same method with `purpose=revoke`)
 
 #### Update Process
 
@@ -366,7 +412,7 @@ The device exposes the following API routes via SmartLayerProxy/TcpBridge:
 | `checkGarageSig2` | Operate garage door (secp256k1 sig, toggle) | NFT + sig |
 | `checkGarageSigP256` | Operate garage door (P-256 sig, timed) | NFT + sig |
 | `checkGarageSigP256_2` | Operate garage door (P-256 sig, toggle) | NFT + sig |
-| `updateReady` | Trigger OTA firmware check | **None** (rate-limited: 60s) |
+| `updateReady` | Trigger OTA check, or revoke→setup OTA when `purpose=revoke` | **None** for normal OTA (60s rate limit). Revoke requires admin-signed `message`/`signature`; response `revoking`. |
 
 **Signature Parameters**:
 - `sig`: Hex-encoded signature (130 chars: r + s + recid)
