@@ -11,9 +11,10 @@
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include <mbedtls/md.h>
-#include <Preferences.h>
 
 #include <Web3.h>
+#include <KeyID.h>
+#include <UniversalNode.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
@@ -91,6 +92,7 @@ ActionHandler* actionHandler;
 // ===== GLOBALS =====
 Web3* web3;
 KeyID* keyID;
+UniversalNode* uninode;
 TcpBridge* tcpConnection;
 WifiStore wifiStore;
 WiFiConnection wifiConnection;
@@ -1279,14 +1281,35 @@ void setup()
   }
 
   // ===== WEB3 INITIALIZATION =====
+  // Web3E 1.47+: Web3(chainId) no longer selects an RPC host. NFT balanceOf
+  // (Contract::ViewCall → eth_call) needs JSON-RPC, so fetch a signed public
+  // RPC pair via universal-node and cache it in EEPROM at offset 828+ (after
+  // KeyID 0-32 and WifiStore 33-827). TcpBridge login itself does not need RPC.
   actionHandler = new ActionHandler(6);
   web3 = new Web3(BASE_SEPOLIA_ID);
-  Serial.print("Init web3");
+  Serial.println("Init web3");
 
   keyID = new KeyID(web3);
-  Serial.print("Got key");
+  Serial.printf("Device Address: %s\n", keyID->getAddress().c_str());
   updateChallenge();
-  Serial.print("Challenge set");
+
+  uninode = new UniversalNode(web3, keyID);
+  Serial.println("[RPC] Syncing NTP for universal-node signed RPC pair...");
+  if (!uninode->syncTime())
+  {
+    Serial.println("[RPC] NTP sync failed — will try EEPROM-cached RPC pair if present");
+    Serial.println(uninode->lastError());
+  }
+  web3->useCachedRpcPair(uninode);
+  if (!web3->maintainCachedRpcPair())
+  {
+    Serial.println("[RPC] WARNING: no usable cached RPC pair yet (NFT balanceOf may fail)");
+    Serial.println(uninode->lastError());
+  }
+  else
+  {
+    Serial.printf("[RPC] Cached public RPC pair ready (count=%d)\n", web3->getCachedRpcCount());
+  }
 
   // ===== RELAY SETUP =====
   pinMode(RELAY_1, OUTPUT);
@@ -1323,6 +1346,10 @@ void loop()
 
   // Maintain WiFi — reconnect/restart only; never open AP on loss
   wifiConnection.setupWifi(nullptr);
+
+  // ~24h-throttled refresh of cached public RPC pair (Web3E 1.47)
+  if (web3)
+    web3->maintainCachedRpcPair();
 
   tcpConnection->checkClientAPI(&handleTCPAPI);
 

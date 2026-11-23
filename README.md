@@ -352,25 +352,24 @@ The device implements **strict semver comparison** with safety features:
 
 ## Dependencies
 
-### Web3E (Pinned to GitHub)
+### Web3E (Pinned to GitHub tag v1.47)
 
 - **Source**: https://github.com/AlphaWallet/Web3E
-- **Commit**: `ef0ef692902ef7545b00c1f955179f5b4e12c126` (Nov 17, 2026)
-- **Version**: 1.45.0+sha.ef0ef69
+- **Tag**: `v1.47` (PlatformIO Registry equivalent: `Web3E@1.47`)
+- **Version**: 1.47
 
-**Why pinned**: Web3E master now includes:
-- `WifiStore`: EEPROM-based Wi-Fi credential storage
-- `WiFiDiagnostics`: Connection quality metrics
-- `TcpBridge` firmware version login (opcode 0x09)
-- Startup watchdog for robust connection handling
+**Includes**:
+- `WifiStore`, `WiFiDiagnostics`, TcpBridge 0x09 version login, startup watchdog
+- Cached public RPC pair (`useCachedRpcPair` / EEPROM offset 828+) for NFT `balanceOf` JSON-RPC
+- Default `WEB3E_EEPROM_SIZE` = 2048
 
 **Declared in platformio.ini**:
 ```ini
 lib_deps = 
-    https://github.com/AlphaWallet/Web3E.git#ef0ef692902ef7545b00c1f955179f5b4e12c126
+    https://github.com/AlphaWallet/Web3E.git#v1.47
 ```
 
-**No more hand-edited libdeps**: All Web3E code comes from the pinned GitHub commit.
+**1.47 note**: `Web3(chainId)` no longer auto-selects an RPC host. This firmware calls `useCachedRpcPair(uninode)` after Wi-Fi + KeyID so door NFT checks keep working. TcpBridge proxy traffic does not need an RPC host.
 
 ### Other Libraries
 
@@ -468,13 +467,18 @@ Admin addresses configured in `secrets.h` bypass NFT checks for all door operati
 - **Watchdog**: Web3E `WiFiConnection` handles automatic reconnection
 - **Diagnostics**: Connection quality metrics reported to proxy (opcode 0x0A)
 
-### EEPROM Layout
+### EEPROM Layout (Web3E 1.47)
 
-- **Bytes 0-32**: KeyID (Web3E device identity key)
-- **Bytes 33+**: WifiStore (magic, version, networks, CRC32)
-- **Total**: 1024 bytes (`WEB3E_EEPROM_SIZE`)
+| Region | Bytes | Contents |
+|--------|-------|----------|
+| KeyID | 0–32 | Device identity key (**never touched** by this firmware beyond KeyID) |
+| WifiStore | 33–827 | Wi-Fi credentials (magic/version/networks/CRC) |
+| RpcPairStore | 828+ | Cached public RPC URL pair (Web3E `useCachedRpcPair`) |
+| Total | `WEB3E_EEPROM_SIZE` **2048** | Shared NVS blob size |
 
-**Critical**: All components use `WEB3E_EEPROM_SIZE=1024` when calling `EEPROM.begin()`. On arduino-esp32 3.x, a smaller size **truncates** the NVS blob.
+GarageDoor only writes WifiStore (migration / captive portal) and never stores anything in the RpcPairStore region. PortalBoot uses NVS namespace `web3e_boot`, not EEPROM.
+
+**Critical**: All components use the same `WEB3E_EEPROM_SIZE` when calling `EEPROM.begin()`. On arduino-esp32 3.x, a smaller size **truncates** the NVS blob.
 
 ## Troubleshooting
 
