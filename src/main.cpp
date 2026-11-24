@@ -6,10 +6,15 @@
 #include "EEPROM.h"
 #include <APIReturn.h>
 #include "P256Crypto.h"
+#include "CaptivePortal.h"
 
 #include "esp_system.h"
+#include "esp_task_wdt.h"
+#include <mbedtls/md.h>
 
 #include <Web3.h>
+#include <KeyID.h>
+#include <UniversalNode.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
@@ -20,12 +25,15 @@
 #include <WifiStore.h>
 #include <WiFiDiagnostics.h>
 #include <ArduinoJson.h>
+#include <PortalBoot.h>
+#include <ProvisioningWifiStore.h>
 
 #include <functional>
 #include <string>
 #include <vector>
 #include <map>
 #include <SPI.h>
+#include <ctype.h>
 
 // Include secrets (gitignored; see secrets.h.example)
 #ifndef NO_SECRETS_FALLBACK
@@ -37,7 +45,7 @@
 // ===== FIRMWARE VERSION =====
 // Format: <PROJECT_ID>@<semver>+<shorthash>
 // Example: garagedoor@1.2.0+ab12cd3
-#define FIRMWARE_SEMVER "1.2.6"
+#define FIRMWARE_SEMVER "1.2.7"
 
 // GIT_SHORT_HASH is injected by git_version.py at build time
 #ifndef GIT_SHORT_HASH
@@ -84,9 +92,18 @@ ActionHandler* actionHandler;
 // ===== GLOBALS =====
 Web3* web3;
 KeyID* keyID;
+UniversalNode* uninode;
 TcpBridge* tcpConnection;
 WifiStore wifiStore;
 WiFiConnection wifiConnection;
+PortalBoot portalBoot;
+
+// Revoke notice → install setup firmware (processed from loop after updateReady)
+// Contract: SmartLayerProxy docs/firmware-ota.md + PR #16
+static volatile bool revokeRequested = false;
+static char pendingRevokeSha256[65] = {0};
+static char pendingRevokeVersion[32] = {0};
+static size_t pendingRevokeSize = 0;
 
 const char* seedWords[] = { "Apples", "Oranges", "Grapes", "DragonFruit", "BreadFruit", 
                              "Pomegranate", "Aubergine", "Fungi", "Falafel", "Cryptokitty", 
@@ -116,6 +133,13 @@ void operateGarageDoor();
 bool checkForUpdate();
 void performOTA(const char* firmwareUrl, const char* expectedSha256, size_t expectedSize, const char* versionStr = nullptr);
 bool writeWifiStoreFromSecrets();
+void armMainLoopWatchdog();
+bool validateAndQueueRevoke(APIReturn* apiReturn);
+bool installSetupFirmwareFromNotice();
+void runOfflinePortalAndReboot();
+static string normalizeAddress(const string& addr);
+static bool parseRevokeMessage(const string& message, string& project, string& device,
+                               string& sha256, string& nonce);
 
 // ===== UTILITY FUNCTIONS =====
 bool equalsIgnoreCase(const string& a, const string& b)
@@ -863,22 +887,38 @@ std::string handleTCPAPI(APIReturn* apiReturn)
   
   case api_updateReady:
   {
-    // New unauthenticated OTA trigger (proxy pushes notification)
-    // Rate limited to once per 60 seconds (but first request always accepted)
+    // Extended OTA notify channel (SmartLayerProxy):
+    //   - no args / purpose absent → normal app OTA check → "checking"
+    //   - purpose=revoke → admin-signed setup OTA → must reply "revoking"
+    const string purpose = apiReturn->params.count("purpose")
+                               ? apiReturn->params["purpose"]
+                               : string("");
+
+    if (purpose == "revoke")
+    {
+      Serial.println("[Revoke] Admin-signed revoke notice received");
+      if (!validateAndQueueRevoke(apiReturn))
+      {
+        Serial.println("[Revoke] Notice rejected");
+        return string("revoke_rejected");
+      }
+      // Required ack before stay_portal + setup OTA (proxy marks acknowledged)
+      revokeRequested = true;
+      return string("revoking");
+    }
+
+    // Normal OTA trigger — rate limited to once per 60 seconds
     unsigned long now = millis();
     if (lastOTARequestInitialized && (now - lastOTARequest < OTA_RATE_LIMIT_MS))
     {
       Serial.printf("[OTA] Rate limited (last request %lu ms ago)\n", now - lastOTARequest);
       return string("rate_limited");
     }
-    
+
     lastOTARequest = now;
     lastOTARequestInitialized = true;
     Serial.println("[OTA] Update notification received from proxy");
-    
-    // Request OTA check in loop() (non-blocking response)
     otaCheckRequested = true;
-    
     return string("checking");
   }
   break;
@@ -892,6 +932,245 @@ std::string handleTCPAPI(APIReturn* apiReturn)
   return string("");
 }
 
+// ===== REVOKE / PORTAL / WDT HELPERS =====
+
+static string normalizeAddress(const string& addr)
+{
+  string hex = addr;
+  if (hex.size() >= 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X'))
+    hex = hex.substr(2);
+  for (size_t i = 0; i < hex.size(); i++)
+    hex[i] = (char)tolower((unsigned char)hex[i]);
+  return string("0x") + hex;
+}
+
+static bool parseRevokeMessage(const string& message, string& project, string& device,
+                               string& sha256, string& nonce)
+{
+  // revoke:<project>:<device>:<sha256>:<nonce>
+  if (message.size() < 7 || message.compare(0, 7, "revoke:") != 0)
+    return false;
+
+  size_t p1 = message.find(':', 7);
+  if (p1 == string::npos)
+    return false;
+  size_t p2 = message.find(':', p1 + 1);
+  if (p2 == string::npos)
+    return false;
+  size_t p3 = message.find(':', p2 + 1);
+  if (p3 == string::npos)
+    return false;
+
+  project = message.substr(7, p1 - 7);
+  device = message.substr(p1 + 1, p2 - p1 - 1);
+  sha256 = message.substr(p2 + 1, p3 - p2 - 1);
+  nonce = message.substr(p3 + 1);
+
+  if (project.empty() || device.empty() || sha256.size() != 64 || nonce.size() != 64)
+    return false;
+  return true;
+}
+
+bool validateAndQueueRevoke(APIReturn* apiReturn)
+{
+  if (!apiReturn || !keyID)
+    return false;
+
+  const string version = apiReturn->params.count("version") ? apiReturn->params["version"] : "";
+  const string sha256 = apiReturn->params.count("sha256") ? apiReturn->params["sha256"] : "";
+  const string sizeStr = apiReturn->params.count("size") ? apiReturn->params["size"] : "";
+  string message = apiReturn->params.count("message") ? apiReturn->params["message"] : "";
+  string signature = apiReturn->params.count("signature") ? apiReturn->params["signature"] : "";
+
+  if (version.empty() || sha256.size() != 64 || sizeStr.empty() || message.empty() || signature.empty())
+  {
+    Serial.println("[Revoke] Missing required notice fields");
+    return false;
+  }
+
+  size_t sizeVal = (size_t)strtoul(sizeStr.c_str(), nullptr, 10);
+  if (sizeVal == 0)
+  {
+    Serial.println("[Revoke] Invalid size");
+    return false;
+  }
+
+  string msgProject, msgDevice, msgSha, msgNonce;
+  if (!parseRevokeMessage(message, msgProject, msgDevice, msgSha, msgNonce))
+  {
+    Serial.println("[Revoke] Bad message format (expected revoke:<project>:<device>:<sha256>:<nonce>)");
+    return false;
+  }
+
+  if (msgProject != PROJECT_ID)
+  {
+    Serial.printf("[Revoke] Project mismatch: %s vs %s\n", msgProject.c_str(), PROJECT_ID);
+    return false;
+  }
+
+  if (!equalsIgnoreCase(msgSha, sha256))
+  {
+    Serial.println("[Revoke] sha256 arg does not match message binding");
+    return false;
+  }
+
+  string selfAddr = normalizeAddress(keyID->getAddress());
+  string noticeAddr = normalizeAddress(msgDevice);
+  if (!equalsIgnoreCase(selfAddr, noticeAddr))
+  {
+    Serial.printf("[Revoke] Device mismatch: notice=%s self=%s\n",
+                  noticeAddr.c_str(), selfAddr.c_str());
+    return false;
+  }
+
+  // EIP-191 personal_sign recovery → must be a compiled-in admin address
+  string recovered = Crypto::ECRecoverFromPersonalMessage(&signature, &message);
+  if (recovered.empty() || !checkAdmin(&recovered))
+  {
+    Serial.printf("[Revoke] Admin signature check failed (recovered=%s)\n", recovered.c_str());
+    return false;
+  }
+
+  strncpy(pendingRevokeSha256, sha256.c_str(), sizeof(pendingRevokeSha256) - 1);
+  pendingRevokeSha256[sizeof(pendingRevokeSha256) - 1] = '\0';
+  strncpy(pendingRevokeVersion, version.c_str(), sizeof(pendingRevokeVersion) - 1);
+  pendingRevokeVersion[sizeof(pendingRevokeVersion) - 1] = '\0';
+  pendingRevokeSize = sizeVal;
+
+  Serial.printf("[Revoke] Accepted — setup version=%s sha256=%.16s... size=%zu\n",
+                pendingRevokeVersion, pendingRevokeSha256, pendingRevokeSize);
+  return true;
+}
+
+bool installSetupFirmwareFromNotice()
+{
+  Serial.println("[Revoke] Installing setup firmware...");
+
+  // App MUST set stay_portal=1 before OTA-installing setup (Web3E-Setup-Firmware#3)
+  if (portalBoot.isInitialized())
+  {
+    if (!portalBoot.setStayInPortal(true))
+      Serial.println("[Revoke] WARNING: failed to set stay_portal=1");
+    else
+      Serial.println("[Revoke] stay_portal=1 written (NVS web3e_boot)");
+  }
+  else
+  {
+    Serial.println("[Revoke] WARNING: PortalBoot not initialized — stay_portal not set");
+  }
+
+  // URL is never on the wire — fetch from proxy setup channel
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  String url = String(PROXY_BASE_URL) + "/api/firmware/" + PROJECT_ID + "/setup";
+  Serial.printf("[Revoke] Fetching setup metadata: %s\n", url.c_str());
+
+  if (!http.begin(client, url))
+  {
+    Serial.println("[Revoke] Failed to begin setup metadata request");
+    return false;
+  }
+
+  http.setTimeout(10000);
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK)
+  {
+    Serial.printf("[Revoke] Setup metadata HTTP error: %d\n", httpCode);
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error)
+  {
+    Serial.printf("[Revoke] JSON parse error: %s\n", error.c_str());
+    return false;
+  }
+
+  const char* metaVersion = doc["version"];
+  const char* metaUrl = doc["url"];
+  const char* metaSha = doc["sha256"];
+  size_t metaSize = doc["size"];
+
+  if (!metaVersion || !metaUrl || !metaSha || metaSize == 0)
+  {
+    Serial.println("[Revoke] Setup metadata missing fields");
+    return false;
+  }
+
+  if (strcasecmp(metaSha, pendingRevokeSha256) != 0)
+  {
+    Serial.println("[Revoke] Setup metadata sha256 does not match notice");
+    return false;
+  }
+  if (metaSize != pendingRevokeSize)
+  {
+    Serial.printf("[Revoke] Setup metadata size mismatch: meta=%zu notice=%zu\n",
+                  metaSize, pendingRevokeSize);
+    return false;
+  }
+  if (strcmp(metaVersion, pendingRevokeVersion) != 0)
+  {
+    Serial.printf("[Revoke] Setup metadata version mismatch: meta=%s notice=%s\n",
+                  metaVersion, pendingRevokeVersion);
+    return false;
+  }
+
+  // Install even if "older" than app — revoke is not a semver upgrade.
+  // performOTA verifies sha256+size and reboots on success.
+  performOTA(metaUrl, metaSha, metaSize, metaVersion);
+  return true;
+}
+
+void armMainLoopWatchdog()
+{
+  // Cover hung loop() — TcpBridge liveness alone only runs inside checkClientAPI.
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+  esp_task_wdt_config_t cfg = {
+      .timeout_ms = 30000,
+      .idle_core_mask = 0,
+      .trigger_panic = true,
+  };
+  esp_err_t err = esp_task_wdt_reconfigure(&cfg);
+  if (err == ESP_ERR_INVALID_STATE)
+    err = esp_task_wdt_init(&cfg);
+#else
+  esp_err_t err = esp_task_wdt_init(30, true);
+#endif
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    Serial.printf("[WDT] init/reconfigure: %s\n", esp_err_to_name(err));
+
+  err = esp_task_wdt_add(NULL);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    Serial.printf("[WDT] add: %s\n", esp_err_to_name(err));
+  else
+    Serial.println("[WDT] Main loop task watchdog armed (30s)");
+}
+
+void runOfflinePortalAndReboot()
+{
+  Serial.println("[Portal] Offline reset / stay_portal — opening embedded captive portal");
+  Serial.println("[Portal] KeyID + WifiStore preserved; AP opened only for this path");
+
+  // KeyID before any WifiStore begin (EEPROM size contract)
+  if (!web3)
+    web3 = new Web3(BASE_SEPOLIA_ID);
+  if (!keyID)
+    keyID = new KeyID(web3);
+
+  string addr = keyID->getAddress();
+  bool saved = captivePortalRun(&portalBoot, addr.c_str());
+  Serial.printf("[Portal] Exiting portal (saved=%d) — rebooting to normal operation\n", saved ? 1 : 0);
+  delay(500);
+  ESP.restart();
+}
+
 // ===== SETUP =====
 
 void setup()
@@ -901,27 +1180,48 @@ void setup()
   Serial.println("=== ESP32 GARAGE DOOR CONTROLLER ===");
   Serial.printf("Firmware: %s\n", FW_VERSION);
   Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
-  
+
+  // NVS portal/boot control shared with Web3E-Setup-Firmware (Preferences web3e_boot).
+  // Never touches EEPROM KeyID (0-32) or WifiStore.
+  bool forcePortal = false;
+  if (!portalBoot.begin())
+  {
+    Serial.println("[PortalBoot] NVS unavailable — continuing without flag");
+  }
+  else
+  {
+    forcePortal = portalBoot.checkAndHandlePowerCycle();
+    if (forcePortal)
+      Serial.println("[PortalBoot] stay_portal active (revoke residue and/or triple power-cycle)");
+  }
+
+  if (forcePortal)
+  {
+    runOfflinePortalAndReboot();
+    return; // not reached
+  }
+
   // Arm startup watchdog (covers WiFi and TCP connect)
   TcpBridge::armStartupWatchdog();
   delay(2000);
-  
+
   Initialize();
   delay(100);
-  
+
   // ===== WIFI SETUP =====
-  // Try WifiStore first, fallback to secrets.h, then write to EEPROM
-  
+  // Try WifiStore first, fallback to secrets.h, then write to EEPROM.
+  // Wi-Fi down alone MUST NEVER open the AP — only retry/restart.
+
   if (!wifiStore.begin())
   {
     Serial.println("[WiFi] WifiStore init failed");
     ESP.restart();
   }
-  
+
   WifiCredential storedCreds[MAX_WIFI_NETWORKS];
   int networkCount = 0;
   bool wifiStoreValid = wifiStore.isValid();
-  
+
   if (wifiStoreValid)
   {
     networkCount = wifiStore.readNetworks(storedCreds, MAX_WIFI_NETWORKS);
@@ -931,10 +1231,9 @@ void setup()
   {
     Serial.println("[WiFi] WifiStore empty/invalid, using fallback credentials");
   }
-  
-  // Convert to WiFiCredentials array
+
   WiFiCredentials wifiNetworks[MAX_WIFI_NETWORKS + 1];
-  
+
   if (networkCount > 0)
   {
     for (int i = 0; i < networkCount; i++)
@@ -947,7 +1246,6 @@ void setup()
   }
   else
   {
-    // Use fallback from secrets.h
     wifiNetworks[0].ssid = WIFI_SSID_1;
     wifiNetworks[0].password = WIFI_PASSWORD_1;
     wifiNetworks[1].ssid = WIFI_SSID_2;
@@ -959,43 +1257,59 @@ void setup()
     wifiNetworks[4].ssid = nullptr;
     wifiNetworks[4].password = nullptr;
   }
-  
-  // Connect to WiFi
+
   wifiConnection.setupWifi(wifiNetworks);
-  
+
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println("[WiFi] Failed to connect, restarting...");
+    // Keep existing retry/restart liveness — do NOT open captive AP on outage.
+    Serial.println("[WiFi] Failed to connect, restarting (AP not opened)...");
     delay(5000);
     ESP.restart();
   }
-  
+
   Serial.printf("[WiFi] Connected to: %s\n", WiFi.SSID().c_str());
   Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
-  
-  // MIGRATION: If WifiStore was invalid/empty, write fallback creds to it
+
   if (!wifiStoreValid && networkCount == 0)
   {
     Serial.println("[WiFi] Migrating: Writing fallback credentials to WifiStore...");
     if (writeWifiStoreFromSecrets())
-    {
       Serial.println("[WiFi] Migration complete - future boots will use WifiStore");
-    }
     else
-    {
       Serial.println("[WiFi] Migration failed - will retry on next boot");
-    }
   }
-  
+
   // ===== WEB3 INITIALIZATION =====
+  // Web3E 1.47+: Web3(chainId) no longer selects an RPC host. NFT balanceOf
+  // (Contract::ViewCall → eth_call) needs JSON-RPC, so fetch a signed public
+  // RPC pair via universal-node and cache it in EEPROM at offset 828+ (after
+  // KeyID 0-32 and WifiStore 33-827). TcpBridge login itself does not need RPC.
   actionHandler = new ActionHandler(6);
   web3 = new Web3(BASE_SEPOLIA_ID);
-  Serial.print("Init web3");
+  Serial.println("Init web3");
 
   keyID = new KeyID(web3);
-  Serial.print("Got key");
+  Serial.printf("Device Address: %s\n", keyID->getAddress().c_str());
   updateChallenge();
-  Serial.print("Challenge set");
+
+  uninode = new UniversalNode(web3, keyID);
+  Serial.println("[RPC] Syncing NTP for universal-node signed RPC pair...");
+  if (!uninode->syncTime())
+  {
+    Serial.println("[RPC] NTP sync failed — will try EEPROM-cached RPC pair if present");
+    Serial.println(uninode->lastError());
+  }
+  web3->useCachedRpcPair(uninode);
+  if (!web3->maintainCachedRpcPair())
+  {
+    Serial.println("[RPC] WARNING: no usable cached RPC pair yet (NFT balanceOf may fail)");
+    Serial.println(uninode->lastError());
+  }
+  else
+  {
+    Serial.printf("[RPC] Cached public RPC pair ready (count=%d)\n", web3->getCachedRpcCount());
+  }
 
   // ===== RELAY SETUP =====
   pinMode(RELAY_1, OUTPUT);
@@ -1009,10 +1323,11 @@ void setup()
   tcpConnection->setWiFiDiagnostics(wifiConnection.getDiagnostics());
   tcpConnection->setKey(keyID, web3);
   tcpConnection->startConnection();
-  
+
+  armMainLoopWatchdog();
+
   Serial.println("[Setup] Complete");
-  
-  // Check for OTA update after connecting
+
   Serial.println("[OTA] Checking for updates at boot...");
   checkForUpdate();
   lastOTACheck = millis();
@@ -1023,17 +1338,29 @@ void setup()
 void loop()
 {
   long currentMillis = millis();
-  
-  // Handle scheduled actions
+  esp_task_wdt_reset();
+
+  portalBoot.clearBootCountIfStable((unsigned long)currentMillis);
+
   actionHandler->CheckEvents(currentMillis);
-  
-  // Maintain WiFi connection
+
+  // Maintain WiFi — reconnect/restart only; never open AP on loss
   wifiConnection.setupWifi(nullptr);
-  
-  // Handle TCP API
+
+  // ~24h-throttled refresh of cached public RPC pair (Web3E 1.47)
+  if (web3)
+    web3->maintainCachedRpcPair();
+
   tcpConnection->checkClientAPI(&handleTCPAPI);
-  
-  // Check if OTA update was requested via updateReady API
+
+  if (revokeRequested)
+  {
+    revokeRequested = false;
+    Serial.println("[Revoke] Starting setup firmware OTA after revoking ack");
+    installSetupFirmwareFromNotice();
+    // On success performOTA reboots; on failure continue running with stay_portal set
+  }
+
   if (otaCheckRequested)
   {
     otaCheckRequested = false;
@@ -1041,8 +1368,7 @@ void loop()
     checkForUpdate();
     lastOTACheck = currentMillis;
   }
-  
-  // Periodic OTA check (every 24 hours)
+
   if (currentMillis - lastOTACheck >= OTA_CHECK_INTERVAL_MS)
   {
     Serial.println("[OTA] Periodic update check (24h)");
