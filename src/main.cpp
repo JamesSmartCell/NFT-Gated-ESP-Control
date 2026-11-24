@@ -45,7 +45,7 @@
 // ===== FIRMWARE VERSION =====
 // Format: <PROJECT_ID>@<semver>+<shorthash>
 // Example: garagedoor@1.2.0+ab12cd3
-#define FIRMWARE_SEMVER "1.2.7"
+#define FIRMWARE_SEMVER "1.2.8"
 
 // GIT_SHORT_HASH is injected by git_version.py at build time
 #ifndef GIT_SHORT_HASH
@@ -97,6 +97,9 @@ TcpBridge* tcpConnection;
 WifiStore wifiStore;
 WiFiConnection wifiConnection;
 PortalBoot portalBoot;
+
+// Store WiFi networks for reconnect (Bug #1 fix)
+static WiFiCredentials savedWifiNetworks[MAX_WIFI_NETWORKS + 1];
 
 // Revoke notice → install setup firmware (processed from loop after updateReady)
 // Contract: SmartLayerProxy docs/firmware-ota.md + PR #16
@@ -1232,33 +1235,32 @@ void setup()
     Serial.println("[WiFi] WifiStore empty/invalid, using fallback credentials");
   }
 
-  WiFiCredentials wifiNetworks[MAX_WIFI_NETWORKS + 1];
-
+  // Build network list in persistent array (Bug #1 fix: used by loop reconnect)
   if (networkCount > 0)
   {
     for (int i = 0; i < networkCount; i++)
     {
-      wifiNetworks[i].ssid = storedCreds[i].ssid;
-      wifiNetworks[i].password = storedCreds[i].password;
+      savedWifiNetworks[i].ssid = storedCreds[i].ssid;
+      savedWifiNetworks[i].password = storedCreds[i].password;
     }
-    wifiNetworks[networkCount].ssid = nullptr;
-    wifiNetworks[networkCount].password = nullptr;
+    savedWifiNetworks[networkCount].ssid = nullptr;
+    savedWifiNetworks[networkCount].password = nullptr;
   }
   else
   {
-    wifiNetworks[0].ssid = WIFI_SSID_1;
-    wifiNetworks[0].password = WIFI_PASSWORD_1;
-    wifiNetworks[1].ssid = WIFI_SSID_2;
-    wifiNetworks[1].password = WIFI_PASSWORD_2;
-    wifiNetworks[2].ssid = WIFI_SSID_3;
-    wifiNetworks[2].password = WIFI_PASSWORD_3;
-    wifiNetworks[3].ssid = WIFI_SSID_4;
-    wifiNetworks[3].password = WIFI_PASSWORD_4;
-    wifiNetworks[4].ssid = nullptr;
-    wifiNetworks[4].password = nullptr;
+    savedWifiNetworks[0].ssid = WIFI_SSID_1;
+    savedWifiNetworks[0].password = WIFI_PASSWORD_1;
+    savedWifiNetworks[1].ssid = WIFI_SSID_2;
+    savedWifiNetworks[1].password = WIFI_PASSWORD_2;
+    savedWifiNetworks[2].ssid = WIFI_SSID_3;
+    savedWifiNetworks[2].password = WIFI_PASSWORD_3;
+    savedWifiNetworks[3].ssid = WIFI_SSID_4;
+    savedWifiNetworks[3].password = WIFI_PASSWORD_4;
+    savedWifiNetworks[4].ssid = nullptr;
+    savedWifiNetworks[4].password = nullptr;
   }
 
-  wifiConnection.setupWifi(wifiNetworks);
+  wifiConnection.setupWifi(savedWifiNetworks);
 
   if (WiFi.status() != WL_CONNECTED)
   {
@@ -1345,7 +1347,8 @@ void loop()
   actionHandler->CheckEvents(currentMillis);
 
   // Maintain WiFi — reconnect/restart only; never open AP on loss
-  wifiConnection.setupWifi(nullptr);
+  // Bug #1 fix: pass saved network list instead of nullptr to prevent crash
+  wifiConnection.setupWifi(savedWifiNetworks);
 
   // ~24h-throttled refresh of cached public RPC pair (Web3E 1.47)
   if (web3)

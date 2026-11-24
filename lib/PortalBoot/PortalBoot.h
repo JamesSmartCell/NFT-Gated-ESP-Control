@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifndef NATIVE_TEST
+#include "esp_system.h"
+#endif
+
 /*
  * Shared boot / portal control contract (NVS).
  *
@@ -43,10 +47,13 @@
 class PortalBoot {
 public:
     // Open NVS namespace. Call once early in setup() (after Serial ok).
+    // Arms a timer to clear boot_count after PORTAL_BOOT_STABLE_MS (Bug #2 fix).
     bool begin();
 
-    // Increment quick-reboot counter. If threshold reached, sets stay_portal
-    // and resets the counter. Returns true if portal must be forced this boot.
+    // Increment quick-reboot counter ONLY for real power-on/external resets.
+    // If threshold reached, sets stay_portal and resets the counter.
+    // Returns true if portal must be forced this boot.
+    // Bug #2 fix: filters out software/watchdog resets.
     bool checkAndHandlePowerCycle();
 
     // True if stay_portal flag is set (revoke or prior triple-cycle).
@@ -58,7 +65,11 @@ public:
 
     // Call from loop() after PORTAL_BOOT_STABLE_MS uptime to clear boot_count.
     void clearBootCountIfStable(unsigned long uptimeMs);
-
+    
+    // Clear boot_count immediately (called by timer or loop)
+    void clearBootCountNow();
+    
+    bool isBootCountCleared() const { return bootCountCleared; }
     uint8_t getBootCount() const;
     bool isInitialized() const { return initialized; }
 
