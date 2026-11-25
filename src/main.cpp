@@ -130,6 +130,13 @@ struct OTAFailure {
 OTAFailure lastOTAFailure = {"", 0};
 #define OTA_FAILURE_RETRY_INTERVAL_MS (24UL * 60 * 60 * 1000)  // 24 hours
 
+// ===== SCAN RESULT STATES =====
+enum ScanResult {
+  SCAN_NONE_OR_FAILED = 0,  // 0 networks or scan failed — don't accumulate or reset
+  SCAN_KNOWN_SEEN = 1,      // Known SSID visible — reset timeout
+  SCAN_ONLY_UNKNOWN = 2     // Networks visible but no known SSID — accumulate timeout
+};
+
 // ===== FORWARD DECLARATIONS =====
 void updateChallenge();
 void startGarageOpen(int openSeconds);
@@ -146,7 +153,7 @@ static bool parseRevokeMessage(const string& message, string& project, string& d
                                string& sha256, string& nonce);
 bool isWifiEverValidated();
 void setWifiEverValidated();
-bool scanForKnownSSID(WiFiCredentials* networks);
+ScanResult scanForKnownSSID(WiFiCredentials* networks);
 
 // ===== UTILITY FUNCTIONS =====
 bool equalsIgnoreCase(const string& a, const string& b)
@@ -1215,9 +1222,12 @@ void setWifiEverValidated()
 
 /**
  * Scan for known SSIDs and attempt connection if found
- * Returns true if a known SSID was found (regardless of connect success)
+ * Returns:
+ *   SCAN_NONE_OR_FAILED - 0 networks or scan failed (don't accumulate or reset)
+ *   SCAN_KNOWN_SEEN - known SSID visible (reset timeout, may or may not connect)
+ *   SCAN_ONLY_UNKNOWN - networks visible but no known SSID (accumulate timeout)
  */
-bool scanForKnownSSID(WiFiCredentials* networks)
+ScanResult scanForKnownSSID(WiFiCredentials* networks)
 {
   WiFi.mode(WIFI_STA);
   int n = WiFi.scanNetworks();
@@ -1225,13 +1235,13 @@ bool scanForKnownSSID(WiFiCredentials* networks)
   if (n < 0)
   {
     Serial.println("[WiFi] Scan failed");
-    return false;
+    return SCAN_NONE_OR_FAILED;
   }
   
   if (n == 0)
   {
     Serial.println("[WiFi] Scan: 0 networks (antenna/radio fault guard — not counting)");
-    return false;
+    return SCAN_NONE_OR_FAILED;
   }
   
   Serial.printf("[WiFi] Scan: %d networks found\n", n);
@@ -1263,7 +1273,7 @@ bool scanForKnownSSID(WiFiCredentials* networks)
         {
           Serial.printf("[WiFi] Connected to: %s\n", WiFi.SSID().c_str());
           WiFi.scanDelete();
-          return true;
+          return SCAN_KNOWN_SEEN;  // Connected
         }
         else
         {
@@ -1278,9 +1288,11 @@ bool scanForKnownSSID(WiFiCredentials* networks)
   if (!knownSsidFound)
   {
     Serial.println("[WiFi] No known SSID in scan results");
+    return SCAN_ONLY_UNKNOWN;
   }
   
-  return knownSsidFound;
+  // Known SSID seen but connect failed
+  return SCAN_KNOWN_SEEN;
 }
 
 // ===== SETUP =====
@@ -1388,9 +1400,11 @@ void setup()
       Serial.println("[WiFi] Entering lost-WiFi scanning loop (5 min threshold)");
       
       unsigned long lastScanTime = 0;
-      unsigned long noKnownSsidTime = 0;  // Accumulated time with no known SSID
+      unsigned long unknownOnlyStartMs = 0;  // Start of "unknown-only" window
+      unsigned long knownSeenLoopStartMs = 0;  // Start of "known SSID visible but failing" loop
       const unsigned long SCAN_INTERVAL_MS = 30000;  // 30 seconds between scans
       const unsigned long LOST_WIFI_THRESHOLD_MS = 5 * 60 * 1000;  // 5 minutes
+      const unsigned long STUCK_RETRY_THRESHOLD_MS = 10 * 60 * 1000;  // 10 minutes stuck with known SSID
       
       bool portalOpened = false;
       
@@ -1403,7 +1417,7 @@ void setup()
         {
           lastScanTime = now;
           
-          bool knownSsidFound = scanForKnownSSID(savedWifiNetworks);
+          ScanResult scanResult = scanForKnownSSID(savedWifiNetworks);
           
           if (WiFi.status() == WL_CONNECTED)
           {
@@ -1412,29 +1426,65 @@ void setup()
             break;
           }
           
-          if (knownSsidFound)
+          if (scanResult == SCAN_KNOWN_SEEN)
           {
             // Known SSID visible but connect failed — keep retrying, don't count toward portal timeout
             Serial.println("[WiFi] Known SSID visible but connect failed — retrying (no portal)");
-            noKnownSsidTime = 0;  // Reset timeout
-          }
-          else
-          {
-            // No known SSID found — accumulate time toward portal threshold
-            noKnownSsidTime += SCAN_INTERVAL_MS;
-            unsigned long remainingMs = (noKnownSsidTime < LOST_WIFI_THRESHOLD_MS) 
-                                           ? (LOST_WIFI_THRESHOLD_MS - noKnownSsidTime) 
-                                           : 0;
-            Serial.printf("[WiFi] No known SSID found (timeout in %lu seconds)\n", remainingMs / 1000);
+            unknownOnlyStartMs = 0;  // Reset portal timeout
             
-            if (noKnownSsidTime >= LOST_WIFI_THRESHOLD_MS)
+            // Start/continue stuck-retry timer
+            if (knownSeenLoopStartMs == 0)
             {
-              // 5 minutes elapsed with no known SSID — open portal
-              Serial.println("[WiFi] Lost-WiFi threshold reached — opening portal");
-              wifiPortal.requestPortal(PORTAL_REASON_LOST_WIFI);
-              runOfflinePortalAndReboot();  // runs portal, reboots on exit
-              portalOpened = true;
+              knownSeenLoopStartMs = now;
+              Serial.println("[WiFi] Starting stuck-retry timer (10 min threshold)");
             }
+            else
+            {
+              unsigned long stuckElapsedMs = now - knownSeenLoopStartMs;
+              if (stuckElapsedMs >= STUCK_RETRY_THRESHOLD_MS)
+              {
+                // Known SSID visible for >10 min but can't connect — restart to restore liveness
+                Serial.println("[WiFi] Stuck retrying for 10+ minutes — restarting to restore liveness");
+                delay(1000);
+                ESP.restart();
+              }
+              unsigned long stuckRemainingMs = STUCK_RETRY_THRESHOLD_MS - stuckElapsedMs;
+              Serial.printf("[WiFi] Known SSID stuck-retry (restart in %lu seconds)\n", stuckRemainingMs / 1000);
+            }
+          }
+          else if (scanResult == SCAN_ONLY_UNKNOWN)
+          {
+            // Networks visible but no known SSID — accumulate time toward portal threshold
+            knownSeenLoopStartMs = 0;  // Reset stuck-retry timer
+            
+            if (unknownOnlyStartMs == 0)
+            {
+              unknownOnlyStartMs = now;
+              Serial.printf("[WiFi] No known SSID found (timeout in %lu seconds)\n", LOST_WIFI_THRESHOLD_MS / 1000);
+            }
+            else
+            {
+              unsigned long elapsedMs = now - unknownOnlyStartMs;
+              if (elapsedMs >= LOST_WIFI_THRESHOLD_MS)
+              {
+                // 5 minutes elapsed with no known SSID — open portal
+                Serial.println("[WiFi] Lost-WiFi threshold reached — opening portal");
+                wifiPortal.requestPortal(PORTAL_REASON_LOST_WIFI);
+                runOfflinePortalAndReboot();  // runs portal, reboots on exit
+                portalOpened = true;
+              }
+              else
+              {
+                unsigned long remainingMs = LOST_WIFI_THRESHOLD_MS - elapsedMs;
+                Serial.printf("[WiFi] No known SSID found (timeout in %lu seconds)\n", remainingMs / 1000);
+              }
+            }
+          }
+          else  // SCAN_NONE_OR_FAILED
+          {
+            // 0 networks or scan failed — don't accumulate or reset
+            Serial.println("[WiFi] Scan returned 0 networks or failed — not counting (antenna/power guard)");
+            // Keep existing timers as-is
           }
         }
         
