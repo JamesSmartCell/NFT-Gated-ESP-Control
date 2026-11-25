@@ -46,7 +46,7 @@
 // ===== FIRMWARE VERSION =====
 // Format: <PROJECT_ID>@<semver>+<shorthash>
 // Example: garagedoor@1.2.0+ab12cd3
-#define FIRMWARE_SEMVER "1.2.9"
+#define FIRMWARE_SEMVER "1.2.10"
 
 // GIT_SHORT_HASH is injected by git_version.py at build time
 #ifndef GIT_SHORT_HASH
@@ -130,12 +130,6 @@ struct OTAFailure {
 OTAFailure lastOTAFailure = {"", 0};
 #define OTA_FAILURE_RETRY_INTERVAL_MS (24UL * 60 * 60 * 1000)  // 24 hours
 
-// ===== SCAN RESULT STATES =====
-enum ScanResult {
-  SCAN_NONE_OR_FAILED = 0,  // 0 networks or scan failed — don't accumulate or reset
-  SCAN_KNOWN_SEEN = 1,      // Known SSID visible — reset timeout
-  SCAN_ONLY_UNKNOWN = 2     // Networks visible but no known SSID — accumulate timeout
-};
 
 // ===== FORWARD DECLARATIONS =====
 void updateChallenge();
@@ -151,9 +145,6 @@ void runOfflinePortalAndReboot();
 static string normalizeAddress(const string& addr);
 static bool parseRevokeMessage(const string& message, string& project, string& device,
                                string& sha256, string& nonce);
-bool isWifiEverValidated();
-void setWifiEverValidated();
-ScanResult scanForKnownSSID(WiFiCredentials* networks);
 
 // ===== UTILITY FUNCTIONS =====
 bool equalsIgnoreCase(const string& a, const string& b)
@@ -1175,125 +1166,14 @@ void runOfflinePortalAndReboot()
   if (!keyID)
     keyID = new KeyID(web3);
 
-  bool saved = wifiPortal.run(0);
+  // Pass device address to portal (Web3E PR #51)
+  string deviceAddr = keyID->getAddress();
+  bool saved = wifiPortal.run(0, deviceAddr.c_str());
   Serial.printf("[Portal] Exiting portal (saved=%d) — rebooting to normal operation\n", saved ? 1 : 0);
   delay(500);
   ESP.restart();
 }
 
-// ===== WIFI VALIDATION PERSISTENCE =====
-
-/**
- * Check if WiFi has ever been validated (connected or known SSID seen)
- * Persisted in NVS namespace web3e_boot (same as portal) for consistency
- */
-bool isWifiEverValidated()
-{
-  Preferences prefs;
-  if (!prefs.begin("web3e_boot", true))  // read-only
-  {
-    Serial.println("[WiFi] WARNING: Could not open NVS web3e_boot for validation check");
-    return false;
-  }
-  bool validated = prefs.getBool("wifi_validated", false);
-  prefs.end();
-  return validated;
-}
-
-/**
- * Mark WiFi as validated (called after successful connect or known SSID seen)
- * Persists across reboots to enable lost-WiFi portal on "moved house" scenario
- */
-void setWifiEverValidated()
-{
-  Preferences prefs;
-  if (!prefs.begin("web3e_boot", false))  // read-write
-  {
-    Serial.println("[WiFi] WARNING: Could not open NVS web3e_boot to set validation flag");
-    return;
-  }
-  if (!prefs.getBool("wifi_validated", false))
-  {
-    prefs.putBool("wifi_validated", true);
-    Serial.println("[WiFi] Validation flag set (NVS web3e_boot)");
-  }
-  prefs.end();
-}
-
-/**
- * Scan for known SSIDs and attempt connection if found
- * Returns:
- *   SCAN_NONE_OR_FAILED - 0 networks or scan failed (don't accumulate or reset)
- *   SCAN_KNOWN_SEEN - known SSID visible (reset timeout, may or may not connect)
- *   SCAN_ONLY_UNKNOWN - networks visible but no known SSID (accumulate timeout)
- */
-ScanResult scanForKnownSSID(WiFiCredentials* networks)
-{
-  WiFi.mode(WIFI_STA);
-  int n = WiFi.scanNetworks();
-  
-  if (n < 0)
-  {
-    Serial.println("[WiFi] Scan failed");
-    return SCAN_NONE_OR_FAILED;
-  }
-  
-  if (n == 0)
-  {
-    Serial.println("[WiFi] Scan: 0 networks (antenna/radio fault guard — not counting)");
-    return SCAN_NONE_OR_FAILED;
-  }
-  
-  Serial.printf("[WiFi] Scan: %d networks found\n", n);
-  
-  // Check if any saved SSID is visible
-  bool knownSsidFound = false;
-  for (int i = 0; networks[i].ssid != nullptr; i++)
-  {
-    for (int j = 0; j < n; j++)
-    {
-      if (strcmp(WiFi.SSID(j).c_str(), networks[i].ssid) == 0)
-      {
-        Serial.printf("[WiFi] Known SSID found: %s (RSSI %ld)\n", networks[i].ssid, (long)WiFi.RSSI(j));
-        knownSsidFound = true;
-        
-        // Set validated flag (known SSID seen = validated)
-        setWifiEverValidated();
-        
-        // Attempt connection
-        WiFi.begin(networks[i].ssid, networks[i].password);
-        unsigned long connectStart = millis();
-        while (WiFi.status() != WL_CONNECTED && (millis() - connectStart < 10000))
-        {
-          delay(500);
-          esp_task_wdt_reset();
-        }
-        
-        if (WiFi.status() == WL_CONNECTED)
-        {
-          Serial.printf("[WiFi] Connected to: %s\n", WiFi.SSID().c_str());
-          WiFi.scanDelete();
-          return SCAN_KNOWN_SEEN;  // Connected
-        }
-        else
-        {
-          Serial.printf("[WiFi] Connect failed for %s, continuing scan\n", networks[i].ssid);
-        }
-      }
-    }
-  }
-  
-  WiFi.scanDelete();
-  
-  if (!knownSsidFound)
-  {
-    Serial.println("[WiFi] No known SSID in scan results");
-    return SCAN_ONLY_UNKNOWN;
-  }
-  
-  // Known SSID seen but connect failed
-  return SCAN_KNOWN_SEEN;
-}
 
 // ===== SETUP =====
 
@@ -1336,7 +1216,7 @@ void setup()
 
   // ===== WIFI SETUP =====
   // Try WifiStore first, fallback to secrets.h, then write to EEPROM.
-  // Startup watchdog armed AFTER WiFi connect (covers TCP connect only).
+  // Startup watchdog armed BEFORE Wi-Fi (covers Wi-Fi + TCP as in 1.2.8).
 
   if (!wifiStore.begin())
   {
@@ -1344,7 +1224,8 @@ void setup()
     ESP.restart();
   }
 
-  WifiCredential storedCreds[MAX_WIFI_NETWORKS];
+  // Bug #3 fix: static so pointers stay valid after setup() returns
+  static WifiCredential storedCreds[MAX_WIFI_NETWORKS];
   int networkCount = 0;
   bool wifiStoreValid = wifiStore.isValid();
 
@@ -1383,135 +1264,24 @@ void setup()
     savedWifiNetworks[4].password = nullptr;
   }
 
-  // Link Wi-Fi portal for lost-WiFi watchdog
-  wifiConnection.setWifiPortal(&wifiPortal);
+  // Arm startup watchdog BEFORE Wi-Fi connect (covers Wi-Fi + TCP as in 1.2.8)
+  TcpBridge::armStartupWatchdog();
+
+  // Simple liveness: setupWifi() already reboots on failure
   wifiConnection.setupWifi(savedWifiNetworks);
 
   if (WiFi.status() != WL_CONNECTED)
   {
-    // Check if WiFi was ever validated (persisted in NVS)
-    bool everValidated = isWifiEverValidated();
-    
-    if (everValidated)
-    {
-      // "Moved house" scenario: WiFi was validated before but can't connect now.
-      // Scan for 5 minutes; if no known SSID seen but other networks visible, open portal.
-      Serial.println("[WiFi] Failed to connect, but wifi_validated flag set");
-      Serial.println("[WiFi] Entering lost-WiFi scanning loop (5 min threshold)");
-      
-      unsigned long lastScanTime = 0;
-      unsigned long unknownOnlyStartMs = 0;  // Start of "unknown-only" window
-      unsigned long knownSeenLoopStartMs = 0;  // Start of "known SSID visible but failing" loop
-      const unsigned long SCAN_INTERVAL_MS = 30000;  // 30 seconds between scans
-      const unsigned long LOST_WIFI_THRESHOLD_MS = 5 * 60 * 1000;  // 5 minutes
-      const unsigned long STUCK_RETRY_THRESHOLD_MS = 10 * 60 * 1000;  // 10 minutes stuck with known SSID
-      
-      bool portalOpened = false;
-      
-      while (WiFi.status() != WL_CONNECTED && !portalOpened)
-      {
-        unsigned long now = millis();
-        
-        // Periodic scan
-        if (now - lastScanTime >= SCAN_INTERVAL_MS)
-        {
-          lastScanTime = now;
-          
-          ScanResult scanResult = scanForKnownSSID(savedWifiNetworks);
-          
-          if (WiFi.status() == WL_CONNECTED)
-          {
-            // Connection succeeded during scan
-            Serial.println("[WiFi] Connected during lost-WiFi scan loop");
-            break;
-          }
-          
-          if (scanResult == SCAN_KNOWN_SEEN)
-          {
-            // Known SSID visible but connect failed — keep retrying, don't count toward portal timeout
-            Serial.println("[WiFi] Known SSID visible but connect failed — retrying (no portal)");
-            unknownOnlyStartMs = 0;  // Reset portal timeout
-            
-            // Start/continue stuck-retry timer
-            if (knownSeenLoopStartMs == 0)
-            {
-              knownSeenLoopStartMs = now;
-              Serial.println("[WiFi] Starting stuck-retry timer (10 min threshold)");
-            }
-            else
-            {
-              unsigned long stuckElapsedMs = now - knownSeenLoopStartMs;
-              if (stuckElapsedMs >= STUCK_RETRY_THRESHOLD_MS)
-              {
-                // Known SSID visible for >10 min but can't connect — restart to restore liveness
-                Serial.println("[WiFi] Stuck retrying for 10+ minutes — restarting to restore liveness");
-                delay(1000);
-                ESP.restart();
-              }
-              unsigned long stuckRemainingMs = STUCK_RETRY_THRESHOLD_MS - stuckElapsedMs;
-              Serial.printf("[WiFi] Known SSID stuck-retry (restart in %lu seconds)\n", stuckRemainingMs / 1000);
-            }
-          }
-          else if (scanResult == SCAN_ONLY_UNKNOWN)
-          {
-            // Networks visible but no known SSID — accumulate time toward portal threshold
-            knownSeenLoopStartMs = 0;  // Reset stuck-retry timer
-            
-            if (unknownOnlyStartMs == 0)
-            {
-              unknownOnlyStartMs = now;
-              Serial.printf("[WiFi] No known SSID found (timeout in %lu seconds)\n", LOST_WIFI_THRESHOLD_MS / 1000);
-            }
-            else
-            {
-              unsigned long elapsedMs = now - unknownOnlyStartMs;
-              if (elapsedMs >= LOST_WIFI_THRESHOLD_MS)
-              {
-                // 5 minutes elapsed with no known SSID — open portal
-                Serial.println("[WiFi] Lost-WiFi threshold reached — opening portal");
-                wifiPortal.requestPortal(PORTAL_REASON_LOST_WIFI);
-                runOfflinePortalAndReboot();  // runs portal, reboots on exit
-                portalOpened = true;
-              }
-              else
-              {
-                unsigned long remainingMs = LOST_WIFI_THRESHOLD_MS - elapsedMs;
-                Serial.printf("[WiFi] No known SSID found (timeout in %lu seconds)\n", remainingMs / 1000);
-              }
-            }
-          }
-          else  // SCAN_NONE_OR_FAILED
-          {
-            // 0 networks or scan failed — don't accumulate or reset
-            Serial.println("[WiFi] Scan returned 0 networks or failed — not counting (antenna/power guard)");
-            // Keep existing timers as-is
-          }
-        }
-        
-        // Feed watchdogs during scanning loop
-        esp_task_wdt_reset();
-        delay(1000);
-      }
-    }
-    else
-    {
-      // WiFi never validated before — normal restart behavior
-      Serial.println("[WiFi] Failed to connect, restarting (wifi_validated not set)...");
-      delay(5000);
-      ESP.restart();
-    }
+    Serial.println("[WiFi] Failed to connect, restarting...");
+    delay(5000);
+    ESP.restart();
   }
 
   Serial.printf("[WiFi] Connected to: %s\n", WiFi.SSID().c_str());
   Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
   
-  // Mark WiFi as validated (arms lost-WiFi watchdog + persists in NVS)
-  setWifiEverValidated();
+  // Mark validated for reconnect tracking (optional; wifiConnection.maintain() handles reconnects)
   wifiConnection.markValidated();
-  Serial.println("[WiFi] Validated — lost-WiFi watchdog armed");
-  
-  // Arm startup watchdog now (covers TCP connect phase only, not WiFi scanning)
-  TcpBridge::armStartupWatchdog();
 
   if (!wifiStoreValid && networkCount == 0)
   {
@@ -1584,7 +1354,7 @@ void loop()
 
   actionHandler->CheckEvents(currentMillis);
 
-  // Maintain WiFi — reconnect + lost-WiFi watchdog (opens portal after 5 min no known SSID)
+  // Maintain WiFi — reconnect on outage (no automatic portal)
   wifiConnection.maintain();
 
   // ~24h-throttled refresh of cached public RPC pair (Web3E 1.47)

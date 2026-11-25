@@ -352,24 +352,27 @@ The device implements **strict semver comparison** with safety features:
 
 ## Dependencies
 
-### Web3E (Pinned to GitHub tag v1.47)
+### Web3E (Pinned to GitHub tag v1.48)
 
 - **Source**: https://github.com/AlphaWallet/Web3E
-- **Tag**: `v1.47` (PlatformIO Registry equivalent: `Web3E@1.47`)
-- **Version**: 1.47
+- **Tag**: `v1.48` (PlatformIO Registry equivalent: `Web3E@1.48`)
+- **Version**: 1.48
 
 **Includes**:
 - `WifiStore`, `WiFiDiagnostics`, TcpBridge 0x09 version login, startup watchdog
 - Cached public RPC pair (`useCachedRpcPair` / EEPROM offset 828+) for NFT `balanceOf` JSON-RPC
 - Default `WEB3E_EEPROM_SIZE` = 2048
+- Portal power-cycle detection (`PortalBoot::checkAndHandlePowerCycle`)
+- Opt-in lost-WiFi watchdog (disabled by default, `setLostWifiTimeout(minutes)` to enable)
+- Portal device address display (`run(timeoutMs, deviceAddress)`)
 
 **Declared in platformio.ini**:
 ```ini
 lib_deps = 
-    https://github.com/AlphaWallet/Web3E.git#v1.47
+    https://github.com/AlphaWallet/Web3E.git#v1.48
 ```
 
-**1.47 note**: `Web3(chainId)` no longer auto-selects an RPC host. This firmware calls `useCachedRpcPair(uninode)` after Wi-Fi + KeyID so door NFT checks keep working. TcpBridge proxy traffic does not need an RPC host.
+**1.48 note**: `Web3(chainId)` no longer auto-selects an RPC host. This firmware calls `useCachedRpcPair(uninode)` after Wi-Fi + KeyID so door NFT checks keep working. TcpBridge proxy traffic does not need an RPC host.
 
 ### Other Libraries
 
