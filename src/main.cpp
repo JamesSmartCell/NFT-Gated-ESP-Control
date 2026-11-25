@@ -6,7 +6,6 @@
 #include "EEPROM.h"
 #include <APIReturn.h>
 #include "P256Crypto.h"
-#include "CaptivePortal.h"
 
 #include "esp_system.h"
 #include "esp_task_wdt.h"
@@ -25,8 +24,9 @@
 #include <WifiStore.h>
 #include <WiFiDiagnostics.h>
 #include <ArduinoJson.h>
-#include <PortalBoot.h>
-#include <ProvisioningWifiStore.h>
+
+#define WEB3E_WIFI_PORTAL
+#include <Web3EWifiPortal.h>
 
 #include <functional>
 #include <string>
@@ -45,7 +45,7 @@
 // ===== FIRMWARE VERSION =====
 // Format: <PROJECT_ID>@<semver>+<shorthash>
 // Example: garagedoor@1.2.0+ab12cd3
-#define FIRMWARE_SEMVER "1.2.8"
+#define FIRMWARE_SEMVER "1.2.9"
 
 // GIT_SHORT_HASH is injected by git_version.py at build time
 #ifndef GIT_SHORT_HASH
@@ -96,7 +96,7 @@ UniversalNode* uninode;
 TcpBridge* tcpConnection;
 WifiStore wifiStore;
 WiFiConnection wifiConnection;
-PortalBoot portalBoot;
+Web3EWifiPortal wifiPortal;
 
 // Store WiFi networks for reconnect (Bug #1 fix)
 static WiFiCredentials savedWifiNetworks[MAX_WIFI_NETWORKS + 1];
@@ -1050,16 +1050,13 @@ bool installSetupFirmwareFromNotice()
   Serial.println("[Revoke] Installing setup firmware...");
 
   // App MUST set stay_portal=1 before OTA-installing setup (Web3E-Setup-Firmware#3)
-  if (portalBoot.isInitialized())
+  if (wifiPortal.requestPortal(PORTAL_REASON_REVOKE))
   {
-    if (!portalBoot.setStayInPortal(true))
-      Serial.println("[Revoke] WARNING: failed to set stay_portal=1");
-    else
-      Serial.println("[Revoke] stay_portal=1 written (NVS web3e_boot)");
+    Serial.println("[Revoke] stay_portal=1 written (NVS web3e_boot, reason=REVOKE)");
   }
   else
   {
-    Serial.println("[Revoke] WARNING: PortalBoot not initialized — stay_portal not set");
+    Serial.println("[Revoke] WARNING: failed to set stay_portal=1");
   }
 
   // URL is never on the wire — fetch from proxy setup channel
@@ -1158,7 +1155,7 @@ void armMainLoopWatchdog()
 
 void runOfflinePortalAndReboot()
 {
-  Serial.println("[Portal] Offline reset / stay_portal — opening embedded captive portal");
+  Serial.println("[Portal] Offline reset / stay_portal — opening Web3E captive portal");
   Serial.println("[Portal] KeyID + WifiStore preserved; AP opened only for this path");
 
   // KeyID before any WifiStore begin (EEPROM size contract)
@@ -1167,8 +1164,7 @@ void runOfflinePortalAndReboot()
   if (!keyID)
     keyID = new KeyID(web3);
 
-  string addr = keyID->getAddress();
-  bool saved = captivePortalRun(&portalBoot, addr.c_str());
+  bool saved = wifiPortal.run(0);
   Serial.printf("[Portal] Exiting portal (saved=%d) — rebooting to normal operation\n", saved ? 1 : 0);
   delay(500);
   ESP.restart();
@@ -1184,24 +1180,30 @@ void setup()
   Serial.printf("Firmware: %s\n", FW_VERSION);
   Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
 
-  // NVS portal/boot control shared with Web3E-Setup-Firmware (Preferences web3e_boot).
-  // Never touches EEPROM KeyID (0-32) or WifiStore.
-  bool forcePortal = false;
-  if (!portalBoot.begin())
+  // Web3E WiFi Portal module (NVS namespace web3e_boot)
+  // Handles: triple power-cycle, lost-WiFi watchdog, revoke API
+  if (!wifiPortal.begin())
   {
-    Serial.println("[PortalBoot] NVS unavailable — continuing without flag");
+    Serial.println("[Portal] WARNING: Portal init failed — continuing without portal support");
   }
   else
   {
-    forcePortal = portalBoot.checkAndHandlePowerCycle();
+    bool forcePortal = wifiPortal.shouldOpenPortal();
     if (forcePortal)
-      Serial.println("[PortalBoot] stay_portal active (revoke residue and/or triple power-cycle)");
-  }
-
-  if (forcePortal)
-  {
-    runOfflinePortalAndReboot();
-    return; // not reached
+    {
+      PortalReason reason = wifiPortal.getPortalReason();
+      const char* reasonStr = "unknown";
+      switch (reason)
+      {
+        case PORTAL_REASON_REVOKE: reasonStr = "revoke"; break;
+        case PORTAL_REASON_POWER_CYCLE: reasonStr = "triple power-cycle"; break;
+        case PORTAL_REASON_LOST_WIFI: reasonStr = "lost WiFi"; break;
+        default: reasonStr = "unspecified"; break;
+      }
+      Serial.printf("[Portal] stay_portal active (reason: %s)\n", reasonStr);
+      runOfflinePortalAndReboot();
+      return; // not reached
+    }
   }
 
   // Arm startup watchdog (covers WiFi and TCP connect)
@@ -1260,6 +1262,8 @@ void setup()
     savedWifiNetworks[4].password = nullptr;
   }
 
+  // Link Wi-Fi portal for lost-WiFi watchdog
+  wifiConnection.setWifiPortal(&wifiPortal);
   wifiConnection.setupWifi(savedWifiNetworks);
 
   if (WiFi.status() != WL_CONNECTED)
@@ -1272,6 +1276,10 @@ void setup()
 
   Serial.printf("[WiFi] Connected to: %s\n", WiFi.SSID().c_str());
   Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
+  
+  // Mark WiFi as validated (arms lost-WiFi watchdog: 5 min no-known-SSID → portal)
+  wifiConnection.markValidated();
+  Serial.println("[WiFi] Validated — lost-WiFi watchdog armed");
 
   if (!wifiStoreValid && networkCount == 0)
   {
@@ -1342,13 +1350,10 @@ void loop()
   long currentMillis = millis();
   esp_task_wdt_reset();
 
-  portalBoot.clearBootCountIfStable((unsigned long)currentMillis);
-
   actionHandler->CheckEvents(currentMillis);
 
-  // Maintain WiFi — reconnect/restart only; never open AP on loss
-  // Bug #1 fix: pass saved network list instead of nullptr to prevent crash
-  wifiConnection.setupWifi(savedWifiNetworks);
+  // Maintain WiFi — reconnect + lost-WiFi watchdog (opens portal after 5 min no known SSID)
+  wifiConnection.maintain();
 
   // ~24h-throttled refresh of cached public RPC pair (Web3E 1.47)
   if (web3)
