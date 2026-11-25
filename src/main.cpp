@@ -1166,7 +1166,9 @@ void runOfflinePortalAndReboot()
   if (!keyID)
     keyID = new KeyID(web3);
 
-  bool saved = wifiPortal.run(0);
+  // Pass device address to portal (Web3E PR #51)
+  string deviceAddr = keyID->getAddress();
+  bool saved = wifiPortal.run(0, deviceAddr.c_str());
   Serial.printf("[Portal] Exiting portal (saved=%d) — rebooting to normal operation\n", saved ? 1 : 0);
   delay(500);
   ESP.restart();
