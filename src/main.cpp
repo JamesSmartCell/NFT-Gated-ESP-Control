@@ -1222,7 +1222,8 @@ void setup()
     ESP.restart();
   }
 
-  WifiCredential storedCreds[MAX_WIFI_NETWORKS];
+  // Bug #3 fix: static so pointers stay valid after setup() returns
+  static WifiCredential storedCreds[MAX_WIFI_NETWORKS];
   int networkCount = 0;
   bool wifiStoreValid = wifiStore.isValid();
 
